@@ -1,6 +1,6 @@
 #pragma once
 
-#include <tl/expected.hpp>
+#include <coro/expected.hpp>
 
 #include <array>
 #include <atomic>
@@ -10,6 +10,20 @@
 
 namespace coro
 {
+namespace rb
+{
+enum class produce_result
+{
+    produced,
+    ring_buffer_stopped
+};
+
+enum class consume_result
+{
+    ring_buffer_stopped
+};
+} // namespace rb
+
 /**
  * @tparam element The type of element the ring buffer will store.  Note that this type should be
  *         cheap to move if possible as it is moved into and out of the buffer upon produce and
@@ -20,27 +34,10 @@ template<typename element, size_t num_elements>
 class ring_buffer
 {
 public:
-    enum class produce_result
-    {
-        produced,
-        ring_buffer_stopped
-    };
-
-    enum class consume_result
-    {
-        ring_buffer_stopped
-    };
-
     /**
-     * @throws std::runtime_error If `num_elements` == 0.
+     * static_assert If `num_elements` == 0.
      */
-    ring_buffer()
-    {
-        if (num_elements == 0)
-        {
-            throw std::runtime_error{"num_elements cannot be zero"};
-        }
-    }
+    ring_buffer() { static_assert(num_elements != 0, "num_elements cannot be zero"); }
 
     ~ring_buffer()
     {
@@ -68,7 +65,7 @@ public:
         {
             std::unique_lock lk{m_rb.m_mutex};
             // Its possible a consumer on another thread consumed an item between await_ready() and await_suspend()
-            // so we must check to see if tehre is space again.
+            // so we must check to see if there is space again.
             if (m_rb.try_produce_locked(lk, m_e))
             {
                 return false;
@@ -90,9 +87,9 @@ public:
         /**
          * @return produce_result
          */
-        auto await_resume() -> produce_result
+        auto await_resume() -> rb::produce_result
         {
-            return !m_stopped ? produce_result::produced : produce_result::ring_buffer_stopped;
+            return !m_stopped ? rb::produce_result::produced : rb::produce_result::ring_buffer_stopped;
         }
 
     private:
@@ -146,11 +143,11 @@ public:
         /**
          * @return The consumed element or std::nullopt if the consume has failed.
          */
-        auto await_resume() -> tl::expected<element, consume_result>
+        auto await_resume() -> expected<element, rb::consume_result>
         {
             if (m_stopped)
             {
-                return tl::make_unexpected(consume_result::ring_buffer_stopped);
+                return unexpected<rb::consume_result>(rb::consume_result::ring_buffer_stopped);
             }
 
             return std::move(m_e);

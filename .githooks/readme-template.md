@@ -1,7 +1,7 @@
-# libcoro C++20 linux coroutine library
+# libcoro C++20 coroutine library
 
-[![CI](https://github.com/jbaldwin/libcoro/workflows/build/badge.svg)](https://github.com/jbaldwin/libcoro/workflows/build/badge.svg)
-[![Coverage Status](https://coveralls.io/repos/github/jbaldwin/libcoro/badge.svg?branch=issue-1/ci)](https://coveralls.io/github/jbaldwin/libcoro?branch=issue-1/ci)
+[![CI](https://github.com/jbaldwin/libcoro/actions/workflows/ci-coverage.yml/badge.svg)](https://github.com/jbaldwin/libcoro/actions/workflows/ci-coverage.yml)
+[![Coverage Status](https://coveralls.io/repos/github/jbaldwin/libcoro/badge.svg?branch=main)](https://coveralls.io/github/jbaldwin/libcoro?branch=main)
 [![Codacy Badge](https://app.codacy.com/project/badge/Grade/c190d4920e6749d4b4d1a9d7d6687f4f)](https://www.codacy.com/gh/jbaldwin/libcoro/dashboard?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=jbaldwin/libcoro&amp;utm_campaign=Badge_Grade)
 [![language][badge.language]][language]
 [![license][badge.license]][license]
@@ -14,6 +14,9 @@
 * C++20 coroutines!
 * Modern Safe C++20 API
 * Higher level coroutine constructs
+    - [coro::sync_wait(awaitable)](#sync_wait)
+    - [coro::when_all(awaitable...) -> awaitable](#when_all)
+    - [coro::when_any(awaitable...) -> awaitable](#when_any)
     - [coro::task<T>](#task)
     - [coro::generator<T>](#generator)
     - [coro::event](#event)
@@ -22,32 +25,86 @@
     - [coro::shared_mutex](#shared_mutex)
     - [coro::semaphore](#semaphore)
     - [coro::ring_buffer<element, num_elements>](#ring_buffer)
-    - coro::sync_wait(awaitable)
-    - coro::when_all(awaitable...) -> awaitable
 * Schedulers
     - [coro::thread_pool](#thread_pool) for coroutine cooperative multitasking
     - [coro::io_scheduler](#io_scheduler) for driving i/o events
-        - Can use coro::thread_pool for latency sensitive or long lived tasks.
+        - Can use `coro::thread_pool` for latency sensitive or long lived tasks.
         - Can use inline task processing for thread per core or short lived tasks.
-        - Currently uses an epoll driver
-    - [coro::task_container](#task_container) for dynamic task lifetimes
+        - Currently uses an epoll driver, only supported on linux.
 * Coroutine Networking
-    - coro::net::dns_resolver for async dns
+    - coro::net::dns::resolver for async dns
         - Uses libc-ares
-    - [coro::net::tcp_client](#io_scheduler)
-        - Supports SSL/TLS via OpenSSL
-    - [coro::net::tcp_server](#io_scheduler)
-        - Supports SSL/TLS via OpenSSL
-    - coro::net::udp_peer
-* [Example TCP/HTTP Echo Server](#tcp_echo_server)
+    - [coro::net::tcp::client](#io_scheduler)
+    - [coro::net::tcp::server](#io_scheduler)
+      * [Example TCP/HTTP Echo Server](#tcp_echo_server)
+    - coro::net::tls::client (OpenSSL)
+    - coro::net::tls::server (OpenSSL)
+    - coro::net::udp::peer
+*
+* [Requirements](#requirements)
+* [Build Instructions](#build-instructions)
+* [Contributing](#contributing)
+* [Support](#support)
 
 ## Usage
 
-### A note on co_await
-Its important to note with coroutines that depending on the construct used _any_ `co_await` has the potential to switch the thread that is executing the currently running coroutine.  In general this shouldn't affect the way any user of the library would write code except for `thread_local`.  Usage of `thread_local` should be extremely careful and _never_ used across any `co_await` boundary do to thread switching and work stealing on thread pools.
+### A note on co_await and threads
+Its important to note with coroutines that _any_ `co_await` has the potential to switch the underyling thread that is executing the currently executing coroutine if the scheduler used has more than 1 thread. In general this shouldn't affect the way any user of the library would write code except for `thread_local`. Usage of `thread_local` should be extremely careful and _never_ used across any `co_await` boundary do to thread switching and work stealing on libcoro's schedulers. The only way this is safe is by using a `coro::thread_pool` with 1 thread or an inline `io_scheduler` which also only has 1 thread.
+
+### A note on lambda captures (do not use them!)
+[C++ Core Guidelines - CP.51: Do no use capturing lambdas that are coroutines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#Rcoro-capture)
+
+The recommendation is to not use lambda captures and instead pass any data into the coroutine via its function arguments to guarantee the argument lifetimes. Lambda captures will be destroyed at the coroutines first suspension point so if they are used past that point it will result in a use after free bug.
+
+### sync_wait
+The `sync_wait` construct is meant to be used outside of a coroutine context to block the calling thread until the coroutine has completed. The coroutine can be executed on the calling thread or scheduled on one of libcoro's schedulers.
+
+```C++
+${EXAMPLE_CORO_SYNC_WAIT}
+```
+
+Expected output:
+```bash
+$ ./examples/coro_sync_wait
+Inline Result = 10
+Offload Result = 20
+```
+
+### when_all
+The `when_all` construct can be used within coroutines to await a set of tasks, or it can be used outside coroutine context in conjunction with `sync_wait` to await multiple tasks. Each task passed into `when_all` will initially be executed serially by the calling thread so it is recommended to offload the tasks onto an executor like `coro::thread_pool` or `coro::io_scheduler` so they can execute in parallel.
+
+```C++
+${EXAMPLE_CORO_WHEN_ALL}
+```
+
+Expected output:
+```bash
+$ ./examples/coro_when_all
+2
+4
+6
+8
+10
+first: 1.21 second: 20
+```
+
+### when_any
+The `when_any` construct can be used within coroutines to await a set of tasks and only return the result of the first task that completes. This can also be used outside of a coroutine context in conjunction with `sync_wait` to await the first result. Each task passed into `when_any` will initially be executed serially by the calling thread so it is recommended to offload the tasks onto an executor like `coro::thread_pool` or `coro::io_scheduler` so they can execute in parallel.
+
+```C++
+${EXAMPLE_CORO_WHEN_ANY}
+```
+
+Expected output:
+```bash
+$ ./examples/coro_when_any
+result = 1
+result = -1
+```
+
 
 ### task
-The `coro::task<T>` is the main coroutine building block within `libcoro`.  Use task to create your coroutines and `co_await` or `co_yield` tasks within tasks to perform asynchronous operations, lazily evaluation or even spreading work out across a `coro::thread_pool`.  Tasks are lightweight and only begin execution upon awaiting them.  If their return type is not `void` then the value can be returned by const reference or by moving (r-value reference).
+The `coro::task<T>` is the main coroutine building block within `libcoro`.  Use task to create your coroutines and `co_await` or `co_yield` tasks within tasks to perform asynchronous operations, lazily evaluation or even spreading work out across a `coro::thread_pool`.  Tasks are lightweight and only begin execution upon awaiting them.
 
 
 ```C++
@@ -210,7 +267,12 @@ consumer 3 shutting down, stop signal received
 ```
 
 ### thread_pool
-`coro::thread_pool` is a statically sized pool of worker threads to execute scheduled coroutines from a FIFO queue.  To schedule a coroutine on a thread pool the pool's `schedule()` function should be `co_awaited` to transfer the execution from the current thread to a thread pool worker thread.  Its important to note that scheduling will first place the coroutine into the FIFO queue and will be picked up by the first available thread in the pool, e.g. there could be a delay if there is a lot of work queued up.
+`coro::thread_pool` is a statically sized pool of worker threads to execute scheduled coroutines from a FIFO queue.  One way to schedule a coroutine on a thread pool is to use the pool's `schedule()` function which should be `co_awaited` inside the coroutine to transfer the execution from the current thread to a thread pool worker thread.  Its important to note that scheduling will first place the coroutine into the FIFO queue and will be picked up by the first available thread in the pool, e.g. there could be a delay if there is a lot of work queued up.
+
+#### Ways to schedule tasks onto a `coro::thread_pool`
+* `coro::thread_pool::schedule()` Use `co_await` on this method inside a coroutine to transfer the tasks execution to the `coro::thread_pool`.
+* `coro::thread_pool::spawn(coro::task<void&& task>)` Spawns the task to be detached and owned by the `coro::thread_pool`, use this if you want to fire and forget the task, the `coro::thread_pool` will maintain the task's lifetime.
+* `coro::thread_pool::schedule(coro::task<T> task) -> coro::task<T>` schedules the task on the `coro::thread_pool` and then returns the result in a task that must be awaited. This is useful if you want to schedule work on the `coro::thread_pool` and want to wait for the result.
 
 ```C++
 ${EXAMPLE_CORO_THREAD_POOL_CPP}
@@ -241,7 +303,7 @@ thread pool worker 0 is shutting down.
 ```
 
 ### io_scheduler
-`coro::io_scheduler` is a i/o event scheduler that can use two methods of task processing:
+`coro::io_scheduler` is a i/o event scheduler execution context that can use two methods of task processing:
 
 * A background `coro::thread_pool`
 * Inline task processing on the `coro::io_scheduler`'s event loop
@@ -252,9 +314,18 @@ Using the inline processing strategy will have the event loop i/o thread process
 
 The `coro::io_scheduler` can use a dedicated spawned thread for processing events that are ready or it can be maually driven via its `process_events()` function for integration into existing event loops.  By default i/o schedulers will spawn a dedicated event thread and use a thread pool to process tasks.
 
-Before getting to an example there are two methods of scheduling work onto an i/o scheduler, the first is by having the caller maintain the lifetime of the task being scheduled and the second is by moving or transfering owership of the task into the i/o scheduler.  The first can allow for return values but requires the caller to manage the lifetime of the coroutine while the second requires the return type of the task to be void but allows for variable or unknown task lifetimes.  Transferring task lifetime to the scheduler can be useful, e.g. for a network request.
+#### Ways to schedule tasks onto a `coro::io_scheduler`
+* `coro::io_scheduler::schedule()` Use `co_await` on this method inside a coroutine to transfer the tasks execution to the `coro::io_scheduler`.
+* `coro::io_scheduler::spawn(coro::task<void&& task>)` Spawns the task to be detached and owned by the `coro::io_scheduler`, use this if you want to fire and forget the task, the `coro::io_scheduler` will maintain the task's lifetime.
+* `coro::io_scheduler::schedule(coro::task<T> task) -> coro::task<T>` schedules the task on the `coro::io_scheduler` and then returns the result in a task that must be awaited. This is useful if you want to schedule work on the `coro::io_scheduler` and want to wait for the result.
+* `coro::io_scheduler::schedule(std::stop_source st, coro::task<T> task, std::chrono::duration timeout) -> coro::expected<T, coro::timeout_status>` schedules the task on the `coro::io_scheduler` and then returns the result in a task that must be awaited. That task will then either return the completed task's value if it completes before the timeout, or a return value denoted the task timed out. If the task times out the `std::stop_source.request_stop()` will be invoked so the task can check for it and stop executing. This must be done by the user, the `coro::io_scheduler` cannot stop the execution of the task but it is able through the `std::stop_source` to signal to the task it should stop executing.
+* `coro::io_scheduler::scheduler_after(std::chrono::milliseconds amount)` schedules the current task to be rescheduled after a specified amount of time has passed.
+* `coro::io_scheduler::schedule_at(std::chrono::steady_clock::time_point time)` schedules the current task to be rescheduled at the specified timepoint.
+* `coro::io_scheduler::yield()` will yield execution of the current task and resume after other tasks have had a chance to execute. This effectively places the task at the back of the queue of waiting tasks.
+* `coro::io_scheduler::yield_for(std::chrono::milliseconds amount)` will yield for the given amount of time and then reschedule the task. This is a yield for at least this much time since its placed in the waiting execution queue and might take additional time to start executing again.
+* `coro::io_scheduler::yield_until(std::chrono::steady_clock::time_point time)` will yield execution until the time point.
 
-The example provided here shows an i/o scheduler that spins up a basic `coro::net::tcp_server` and a `coro::net::tcp_client` that will connect to each other and then send a request and a response.
+The example provided here shows an i/o scheduler that spins up a basic `coro::net::tcp::server` and a `coro::net::tcp::client` that will connect to each other and then send a request and a response.
 
 ```C++
 ${EXAMPLE_CORO_IO_SCHEDULER_CPP}
@@ -271,29 +342,6 @@ client: Hello from server.
 io_scheduler::thread_pool worker 0 stopping
 io_scheduler::thread_pool worker 1 stopping
 io_scheduler::process event thread stop
-```
-
-### task_container
-`coro::task_container` is a special container type that will maintain the lifetime of tasks that do not have a known lifetime.  This is extremely useful for tasks that hold open connections to clients and possibly process multiple requests from that client before shutting down.  The task doesn't know how long it will be alive but at some point in the future it will complete and need to have its resources cleaned up.  The `coro::task_container` does this by wrapping the users task into anothe coroutine task that will mark itself for deletion upon completing within the parent task container.  The task container should then run garbage collection periodically, or by default when a new task is added, to prune completed tasks from the container.
-
-All tasks that are stored within a `coro::task_container` must have a `void` return type since their result cannot be accessed due to the task's lifetime being indeterminate.
-
-```C++
-${EXAMPLE_CORO_TASK_CONTAINER_CPP}
-```
-
-```bash
-$ ./examples/coro_task_container
-server: Hello from client 1
-client: Hello from server 1
-server: Hello from client 2
-client: Hello from server 2
-server: Hello from client 3
-client: Hello from server 3
-server: Hello from client 4
-client: Hello from server 4
-server: Hello from client 5
-client: Hello from server 5
 ```
 
 ### tcp_echo_server
@@ -321,7 +369,7 @@ Completed 10000000 requests
 Finished 10000000 requests
 
 
-Server Software:        
+Server Software:
 Server Hostname:        127.0.0.1
 Server Port:            8888
 
@@ -379,24 +427,27 @@ Transfer/sec:     18.33MB
 
 ### Requirements
     C++20 Compiler with coroutine support
-        g++10.2.1
-        g++10.3.1
-        g++11
-        g++12
-        g++13
+        g++ [10.2.1, 10.3.1, 11, 12, 13]
+        clang++ [16, 17]
+            No networking/TLS support on MacOS.
+        MSVC Windows 2022 CL
+            No networking/TLS support.
     CMake
     make or ninja
     pthreads
     openssl
     gcov/lcov (For generating coverage only)
 
-### Instructions
+### Build Instructions
 
-#### Tested Distos
+#### Tested Operating Systems
 
  * ubuntu:20.04, 22.04
- * fedora:32-37
- * openSUSE/leap:15.2
+ * fedora:32-40
+ * openSUSE/leap:15.6
+ * Windows 2022
+ * Emscripten 3.1.45
+ * MacOS 12
 
 #### Cloning the project
 This project uses git submodules, to properly checkout this project use:
@@ -406,7 +457,6 @@ This project uses git submodules, to properly checkout this project use:
 This project depends on the following git sub-modules:
  * [libc-ares](https://github.com/c-ares/c-ares) For async DNS resolver, this is a git submodule.
  * [catch2](https://github.com/catchorg/Catch2) For testing, this is embedded in the `test/` directory.
- * [expected](https://github.com/TartanLlama/expected) For results on operations that can fail, this is a git submodule in the `vendor/` directory.
 
 #### Building
     mkdir Release && cd Release
@@ -415,15 +465,14 @@ This project depends on the following git sub-modules:
 
 CMake Options:
 
-| Name                          | Default | Description                                                                   |
-|:------------------------------|:--------|:------------------------------------------------------------------------------|
-| LIBCORO_EXTERNAL_DEPENDENCIES | OFF     | Use CMake find_package to resolve dependencies instead of embedded libraries. |
-| LIBCORO_BUILD_TESTS           | ON      | Should the tests be built?                                                    |
-| LIBCORO_CODE_COVERAGE         | OFF     | Should code coverage be enabled? Requires tests to be enabled.                |
-| LIBCORO_BUILD_EXAMPLES        | ON      | Should the examples be built?                                                 |
-| LIBCORO_FEATURE_THREADING     | ON      | Include the features depending on multi-threading support by the standard lib.                                                  |
-| LIBCORO_FEATURE_NETWORKING    | ON      | Include networking features.                                                  |
-| LIBCORO_FEATURE_SSL           | ON      | Include SSL features. Requires networking to be enabled.                                                  |
+| Name                          | Default | Description                                                                                        |
+|:------------------------------|:--------|:---------------------------------------------------------------------------------------------------|
+| LIBCORO_EXTERNAL_DEPENDENCIES | OFF     | Use CMake find_package to resolve dependencies instead of embedded libraries.                      |
+| LIBCORO_BUILD_TESTS           | ON      | Should the tests be built? Note this is only default ON if libcoro is the root CMakeLists.txt      |
+| LIBCORO_CODE_COVERAGE         | OFF     | Should code coverage be enabled? Requires tests to be enabled.                                     |
+| LIBCORO_BUILD_EXAMPLES        | ON      | Should the examples be built? Note this is only default ON if libcoro is the root CMakeLists.txt   |
+| LIBCORO_FEATURE_NETWORKING    | ON      | Include networking features. Requires Linux platform. MSVC/MacOS not supported.                    |
+| LIBCORO_FEATURE_TLS           | ON      | Include TLS features. Requires networking to be enabled. MSVC/MacOS not supported.                 |
 
 #### Adding to your project
 
@@ -462,21 +511,27 @@ target_link_libraries(${PROJECT_NAME} PUBLIC libcoro)
 ##### Package managers
 libcoro is available via package managers [Conan](https://conan.io/center/libcoro) and [vcpkg](https://vcpkg.io/).
 
+### Contributing
+
+Contributing is welcome, if you have ideas or bugs please open an issue. If you want to open a PR they are also welcome, if you are adding a bugfix or a feature please include tests to verify the feature or bugfix is working properly. If it isn't included I will be asking for you to add some!
+
 #### Tests
-The tests will automatically be run by github actions on creating a pull request.  They can also be ran locally:
+The tests will automatically be run by github actions on creating a pull request. They can also be ran locally after building from the build directory:
 
     # Invoke via cmake with all output from the tests displayed to console:
     ctest -VV
 
     # Or invoke directly, can pass the name of tests to execute, the framework used is catch2.
-    # Tests are tagged with their group, below is howt o run all of the coro::net::tcp_server tests:
-    ./Debug/test/libcoro_test "[tcp_server]"
+    # Tests are tagged with their group, below is how to run all of the coro::net::tcp::server tests:
+    ./test/libcoro_test "[tcp_server]"
+
+If you open a PR for a bugfix or new feature please include tests to verify that the change is working as intended. If your PR doesn't include tests I will ask you to add them and won't merge until they are added and working properly. Tests are found in the `/test` directory and are organized by object type.
 
 ### Support
 
 File bug reports, feature requests and questions using [GitHub libcoro Issues](https://github.com/jbaldwin/libcoro/issues)
 
-Copyright © 2020-2022 Josh Baldwin
+Copyright © 2020-2025 Josh Baldwin
 
 [badge.language]: https://img.shields.io/badge/language-C%2B%2B20-yellow.svg
 [badge.license]: https://img.shields.io/badge/license-Apache--2.0-blue

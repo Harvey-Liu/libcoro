@@ -1,7 +1,6 @@
 #pragma once
 
 #include "coro/concepts/range_of.hpp"
-#include "coro/event.hpp"
 #include "coro/task.hpp"
 
 #include <atomic>
@@ -98,7 +97,7 @@ public:
     /**
      * @return The number of executor threads for processing tasks.
      */
-    auto thread_count() const noexcept -> uint32_t { return m_threads.size(); }
+    auto thread_count() const noexcept -> size_t { return m_threads.size(); }
 
     /**
      * Schedules the currently executing coroutine to be run on this thread pool.  This must be
@@ -110,39 +109,40 @@ public:
     [[nodiscard]] auto schedule() -> operation;
 
     /**
-     * @throw std::runtime_error If the thread pool is `shutdown()` scheduling new tasks is not permitted.
-     * @param f The function to execute on the thread pool.
-     * @param args The arguments to call the functor with.
-     * @return A task that wraps the given functor to be executed on the thread pool.
+     * Spawns the given task to be run on this thread pool, the task is detached from the user.
+     * @param task The task to spawn onto the thread pool.
+     * @return True if the task has been spawned onto this thread pool.
      */
-    template<typename functor, typename... arguments>
-    [[nodiscard]] auto schedule(functor&& f, arguments... args) -> task<decltype(f(std::forward<arguments>(args)...))>
+    auto spawn(coro::task<void>&& task) noexcept -> bool;
+
+    /**
+     * Schedules a task on the thread pool and returns another task that must be awaited on for completion.
+     * This can be done via co_await in a coroutine context or coro::sync_wait() outside of coroutine context.
+     * @tparam return_type The return value of the task.
+     * @param task The task to schedule on the thread pool.
+     * @return The task to await for the input task to complete.
+     */
+    template<typename return_type>
+    [[nodiscard]] auto schedule(coro::task<return_type> task) -> coro::task<return_type>
     {
         co_await schedule();
-
-        if constexpr (std::is_same_v<void, decltype(f(std::forward<arguments>(args)...))>)
-        {
-            f(std::forward<arguments>(args)...);
-            co_return;
-        }
-        else
-        {
-            co_return f(std::forward<arguments>(args)...);
-        }
+        co_return co_await task;
     }
 
     /**
      * Schedules any coroutine handle that is ready to be resumed.
      * @param handle The coroutine handle to schedule.
+     * @return True if the coroutine is resumed, false if its a nullptr or the coroutine is already done.
      */
-    auto resume(std::coroutine_handle<> handle) noexcept -> void;
+    auto resume(std::coroutine_handle<> handle) noexcept -> bool;
 
     /**
      * Schedules the set of coroutine handles that are ready to be resumed.
      * @param handles The coroutine handles to schedule.
+     * @param uint64_t The number of tasks resumed, if any where null they are discarded.
      */
     template<coro::concepts::range_of<std::coroutine_handle<>> range_type>
-    auto resume(const range_type& handles) noexcept -> void
+    auto resume(const range_type& handles) noexcept -> uint64_t
     {
         m_size.fetch_add(std::size(handles), std::memory_order::release);
 
@@ -168,7 +168,20 @@ public:
             m_size.fetch_sub(null_handles, std::memory_order::release);
         }
 
-        m_wait_cv.notify_one();
+        uint64_t total = std::size(handles) - null_handles;
+        if (total >= m_threads.size())
+        {
+            m_wait_cv.notify_all();
+        }
+        else
+        {
+            for (uint64_t i = 0; i < total; ++i)
+            {
+                m_wait_cv.notify_one();
+            }
+        }
+
+        return total;
     }
 
     /**
@@ -201,7 +214,6 @@ public:
      */
     auto queue_size() const noexcept -> std::size_t
     {
-        // Might not be totally perfect but good enough, avoids acquiring the lock for now.
         std::atomic_thread_fence(std::memory_order::acquire);
         return m_queue.size();
     }
@@ -215,21 +227,19 @@ private:
     /// The configuration options.
     options m_opts;
     /// The background executor threads.
-    std::vector<std::jthread> m_threads;
-
+    std::vector<std::thread> m_threads;
     /// Mutex for executor threads to sleep on the condition variable.
     std::mutex m_wait_mutex;
     /// Condition variable for each executor thread to wait on when no tasks are available.
     std::condition_variable_any m_wait_cv;
     /// FIFO queue of tasks waiting to be executed.
     std::deque<std::coroutine_handle<>> m_queue;
+
     /**
      * Each background thread runs from this function.
-     * @param stop_token Token which signals when shutdown() has been called.
      * @param idx The executor's idx for internal data structure accesses.
      */
-    auto executor(std::stop_token stop_token, std::size_t idx) -> void;
-
+    auto executor(std::size_t idx) -> void;
     /**
      * @param handle Schedules the given coroutine to be executed upon the first available thread.
      */

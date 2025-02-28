@@ -50,11 +50,11 @@ TEST_CASE("task exception thrown", "[task]")
 
     std::string throw_msg = "I'll be reached";
 
-    auto task = [&]() -> task_type
+    auto task = [](std::string& throw_msg) -> task_type
     {
         throw std::runtime_error(throw_msg);
         co_return "I'll never be reached";
-    }();
+    }(throw_msg);
 
     task.resume();
 
@@ -179,13 +179,13 @@ TEST_CASE("task multiple suspends return integer", "[task]")
 
 TEST_CASE("task resume from promise to coroutine handles of different types", "[task]")
 {
-    auto task1 = [&]() -> coro::task<int>
+    auto task1 = []() -> coro::task<int>
     {
         std::cerr << "Task ran\n";
         co_return 42;
     }();
 
-    auto task2 = [&]() -> coro::task<void>
+    auto task2 = []() -> coro::task<void>
     {
         std::cerr << "Task 2 ran\n";
         co_return;
@@ -266,7 +266,7 @@ TEST_CASE("const task returning a reference", "[task]")
 
     type return_value{42};
 
-    auto task = [&]() -> coro::task<const type&> { co_return std::ref(return_value); }();
+    auto task = [](type& return_value) -> coro::task<const type&> { co_return std::ref(return_value); }(return_value);
 
     task.resume();
     REQUIRE(task.is_ready());
@@ -285,7 +285,7 @@ TEST_CASE("mutable task returning a reference", "[task]")
 
     type return_value{42};
 
-    auto task = [&]() -> coro::task<type&> { co_return std::ref(return_value); }();
+    auto task = [](type& return_value) -> coro::task<type&> { co_return std::ref(return_value); }(return_value);
 
     task.resume();
     REQUIRE(task.is_ready());
@@ -323,7 +323,121 @@ TEST_CASE("task supports instantiation with rvalue reference", "[task]")
     // reference is supported.
 
     int  i         = 42;
-    auto make_task = [&i]() -> coro::task<int&&> { co_return std::move(i); };
-    int  ret       = coro::sync_wait(make_task());
+    auto make_task = [](int& i) -> coro::task<int&&> { co_return std::move(i); };
+    int  ret       = coro::sync_wait(make_task(i));
     REQUIRE(ret == 42);
+}
+
+struct move_construct_only
+{
+    static int move_count;
+    move_construct_only(int& i) : i(i) {}
+    move_construct_only(move_construct_only&& x) noexcept : i(x.i) { ++move_count; }
+    move_construct_only(const move_construct_only&)            = delete;
+    move_construct_only& operator=(move_construct_only&&)      = delete;
+    move_construct_only& operator=(const move_construct_only&) = delete;
+    ~move_construct_only()                                     = default;
+    int& i;
+};
+
+int move_construct_only::move_count = 0;
+
+struct copy_construct_only
+{
+    static int copy_count;
+    copy_construct_only(int i) : i(i) {}
+    copy_construct_only(copy_construct_only&&) = delete;
+    copy_construct_only(const copy_construct_only& x) noexcept : i(x.i) { ++copy_count; }
+    copy_construct_only& operator=(copy_construct_only&&)      = delete;
+    copy_construct_only& operator=(const copy_construct_only&) = delete;
+    ~copy_construct_only()                                     = default;
+    int i;
+};
+
+int copy_construct_only::copy_count = 0;
+
+struct move_copy_construct_only
+{
+    static int move_count;
+    static int copy_count;
+    move_copy_construct_only(int i) : i(i) {}
+    move_copy_construct_only(move_copy_construct_only&& x) noexcept : i(x.i) { ++move_count; }
+    move_copy_construct_only(const move_copy_construct_only& x) noexcept : i(x.i) { ++copy_count; }
+    move_copy_construct_only& operator=(move_copy_construct_only&&)      = delete;
+    move_copy_construct_only& operator=(const move_copy_construct_only&) = delete;
+    ~move_copy_construct_only()                                          = default;
+    int i;
+};
+
+int move_copy_construct_only::move_count = 0;
+int move_copy_construct_only::copy_count = 0;
+
+TEST_CASE("task supports instantiation with non assignable type", "[task]")
+{
+    // https://github.com/jbaldwin/libcoro/issues/193
+    // Reported issue that the return type cannot be non assignable type.
+    // This test explicitly creates an coroutine that returns a task
+    // instantiated with non assignable types to verify that non assignable
+    // types are supported.
+
+    int i                           = 42;
+    move_construct_only::move_count = 0;
+    auto move_task                  = [&i]() -> coro::task<move_construct_only> { co_return move_construct_only(i); };
+    auto move_ret                   = coro::sync_wait(move_task());
+    REQUIRE(std::addressof(move_ret.i) == std::addressof(i));
+    REQUIRE(move_construct_only::move_count == 2);
+
+    move_construct_only::move_count = 0;
+    auto move_task2                 = [&i]() -> coro::task<move_construct_only> { co_return i; };
+    auto move_ret2                  = coro::sync_wait(move_task2());
+    REQUIRE(std::addressof(move_ret2.i) == std::addressof(i));
+    REQUIRE(move_construct_only::move_count == 1);
+
+    copy_construct_only::copy_count = 0;
+    auto copy_task                  = [&i]() -> coro::task<copy_construct_only> { co_return copy_construct_only(i); };
+    auto copy_ret                   = coro::sync_wait(copy_task());
+    REQUIRE(copy_ret.i == 42);
+    REQUIRE(copy_construct_only::copy_count == 2);
+
+    copy_construct_only::copy_count = 0;
+    auto copy_task2                 = [&i]() -> coro::task<copy_construct_only> { co_return i; };
+    auto copy_ret2                  = coro::sync_wait(copy_task2());
+    REQUIRE(copy_ret2.i == 42);
+    REQUIRE(copy_construct_only::copy_count == 1);
+
+    move_copy_construct_only::move_count = 0;
+    move_copy_construct_only::copy_count = 0;
+    auto move_copy_task = [&i]() -> coro::task<move_copy_construct_only> { co_return move_copy_construct_only(i); };
+    auto task           = move_copy_task();
+    auto move_copy_ret1 = coro::sync_wait(task);
+    auto move_copy_ret2 = coro::sync_wait(std::move(task));
+    REQUIRE(move_copy_ret1.i == 42);
+    REQUIRE(move_copy_ret2.i == 42);
+    REQUIRE(move_copy_construct_only::move_count == 2);
+    REQUIRE(move_copy_construct_only::copy_count == 1);
+
+    auto make_tuple_task = [](int i) -> coro::task<std::tuple<int, int>> {
+        co_return {i, i * 2};
+    };
+    auto tuple_ret = coro::sync_wait(make_tuple_task(i));
+    REQUIRE(std::get<0>(tuple_ret) == 42);
+    REQUIRE(std::get<1>(tuple_ret) == 84);
+
+    auto  make_ref_task = [&i]() -> coro::task<int&> { co_return std::ref(i); };
+    auto& ref_ret       = coro::sync_wait(make_ref_task());
+    REQUIRE(std::addressof(ref_ret) == std::addressof(i));
+}
+
+TEST_CASE("task promise sizeof", "[task]")
+{
+    REQUIRE(sizeof(coro::detail::promise<void>) >= sizeof(std::coroutine_handle<>) + sizeof(std::exception_ptr));
+    REQUIRE(
+        sizeof(coro::detail::promise<int32_t>) ==
+        sizeof(std::coroutine_handle<>) + sizeof(std::variant<int32_t, std::exception_ptr>));
+    REQUIRE(
+        sizeof(coro::detail::promise<int64_t>) >=
+        sizeof(std::coroutine_handle<>) + sizeof(std::variant<int64_t, std::exception_ptr>));
+    REQUIRE(
+        sizeof(coro::detail::promise<std::vector<int64_t>>) >=
+        sizeof(std::coroutine_handle<>) + sizeof(std::variant<std::vector<int64_t>, std::exception_ptr>));
 }

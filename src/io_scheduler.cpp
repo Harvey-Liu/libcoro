@@ -1,4 +1,5 @@
 #include "coro/io_scheduler.hpp"
+#include "coro/detail/task_self_deleting.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -14,36 +15,44 @@ using namespace std::chrono_literals;
 
 namespace coro
 {
-io_scheduler::io_scheduler(options opts)
-    : m_opts(std::move(opts)),
+io_scheduler::io_scheduler(options&& opts, private_constructor)
+    : m_opts(opts),
       m_epoll_fd(epoll_create1(EPOLL_CLOEXEC)),
       m_shutdown_fd(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)),
       m_timer_fd(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)),
-      m_schedule_fd(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)),
-      m_owned_tasks(new coro::task_container<coro::io_scheduler>(*this))
+      m_schedule_fd(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK))
+
 {
+}
+
+auto io_scheduler::make_shared(options opts) -> std::shared_ptr<io_scheduler>
+{
+    auto s = std::make_shared<io_scheduler>(std::move(opts), private_constructor{});
+
     if (opts.execution_strategy == execution_strategy_t::process_tasks_on_thread_pool)
     {
-        m_thread_pool = std::make_unique<thread_pool>(std::move(m_opts.pool));
+        s->m_thread_pool = std::make_unique<thread_pool>(std::move(s->m_opts.pool));
     }
 
     epoll_event e{};
     e.events = EPOLLIN;
 
     e.data.ptr = const_cast<void*>(m_shutdown_ptr);
-    epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, m_shutdown_fd, &e);
+    epoll_ctl(s->m_epoll_fd, EPOLL_CTL_ADD, s->m_shutdown_fd, &e);
 
     e.data.ptr = const_cast<void*>(m_timer_ptr);
-    epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, m_timer_fd, &e);
+    epoll_ctl(s->m_epoll_fd, EPOLL_CTL_ADD, s->m_timer_fd, &e);
 
     e.data.ptr = const_cast<void*>(m_schedule_ptr);
-    epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, m_schedule_fd, &e);
+    epoll_ctl(s->m_epoll_fd, EPOLL_CTL_ADD, s->m_schedule_fd, &e);
 
-    if (m_opts.thread_strategy == thread_strategy_t::spawn)
+    if (s->m_opts.thread_strategy == thread_strategy_t::spawn)
     {
-        m_io_thread = std::thread([this]() { process_events_dedicated_thread(); });
+        s->m_io_thread = std::thread([s]() { s->process_events_dedicated_thread(); });
     }
     // else manual mode, the user must call process_events.
+
+    return s;
 }
 
 io_scheduler::~io_scheduler()
@@ -70,18 +79,20 @@ io_scheduler::~io_scheduler()
         close(m_schedule_fd);
         m_schedule_fd = -1;
     }
-
-    if (m_owned_tasks != nullptr)
-    {
-        delete static_cast<coro::task_container<coro::io_scheduler>*>(m_owned_tasks);
-        m_owned_tasks = nullptr;
-    }
 }
 
 auto io_scheduler::process_events(std::chrono::milliseconds timeout) -> std::size_t
 {
     process_events_manual(timeout);
     return size();
+}
+
+auto io_scheduler::spawn(coro::task<void>&& task) -> bool
+{
+    m_size.fetch_add(1, std::memory_order::release);
+    auto owned_task = detail::make_task_self_deleting(std::move(task));
+    owned_task.promise().executor_size(m_size);
+    return resume(owned_task.handle());
 }
 
 auto io_scheduler::schedule_after(std::chrono::milliseconds amount) -> coro::task<void>
@@ -253,11 +264,10 @@ auto io_scheduler::process_events_execute(std::chrono::milliseconds timeout) -> 
                 // Process scheduled coroutines.
                 process_scheduled_execute_inline();
             }
-            else if (handle_ptr == m_shutdown_ptr)
-                [[unlikely]]
-                {
-                    // Nothing to do , just needed to wake-up and smell the flowers
-                }
+            else if (handle_ptr == m_shutdown_ptr) [[unlikely]]
+            {
+                // Nothing to do , just needed to wake-up and smell the flowers
+            }
             else
             {
                 // Individual poll task wake-up.

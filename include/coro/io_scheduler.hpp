@@ -1,9 +1,9 @@
 #pragma once
 
 #include "coro/detail/poll_info.hpp"
+#include "coro/expected.hpp"
 #include "coro/fd.hpp"
 #include "coro/poll.hpp"
-#include "coro/task_container.hpp"
 #include "coro/thread_pool.hpp"
 
 #ifdef LIBCORO_FEATURE_NETWORKING
@@ -21,11 +21,20 @@
 
 namespace coro
 {
-class io_scheduler
+enum timeout_status
 {
-    using clock        = detail::poll_info::clock;
-    using time_point   = detail::poll_info::time_point;
+    no_timeout,
+    timeout,
+};
+
+class io_scheduler : public std::enable_shared_from_this<io_scheduler>
+{
     using timed_events = detail::poll_info::timed_events;
+
+    struct private_constructor
+    {
+        private_constructor() = default;
+    };
 
 public:
     class schedule_operation;
@@ -71,7 +80,18 @@ public:
         const execution_strategy_t execution_strategy{execution_strategy_t::process_tasks_on_thread_pool};
     };
 
-    explicit io_scheduler(
+    /**
+     * @see io_scheduler::make_shared
+     */
+    explicit io_scheduler(options&& opts, private_constructor);
+
+    /**
+     * @brief Creates an io_scheduler.
+     *
+     * @param opts
+     * @return std::shared_ptr<io_scheduler>
+     */
+    static auto make_shared(
         options opts = options{
             .thread_strategy            = thread_strategy_t::spawn,
             .on_io_thread_start_functor = nullptr,
@@ -81,7 +101,7 @@ public:
                      ((std::thread::hardware_concurrency() > 1) ? (std::thread::hardware_concurrency() - 1) : 1),
                  .on_thread_start_functor = nullptr,
                  .on_thread_stop_functor  = nullptr},
-            .execution_strategy = execution_strategy_t::process_tasks_on_thread_pool});
+            .execution_strategy = execution_strategy_t::process_tasks_on_thread_pool}) -> std::shared_ptr<io_scheduler>;
 
     io_scheduler(const io_scheduler&)                    = delete;
     io_scheduler(io_scheduler&&)                         = delete;
@@ -158,17 +178,100 @@ public:
     auto schedule() -> schedule_operation { return schedule_operation{*this}; }
 
     /**
-     * Schedules a task onto the io_scheduler and moves ownership of the task to the io_scheduler.
-     * Only void return type tasks can be scheduled in this manner since the task submitter will no
-     * longer have control over the scheduled task.
+     * Spawns a task into the io_scheduler and moves ownership of the task to the io_scheduler.
+     * Only void return type tasks can be spawned in this manner since the task submitter will no
+     * longer have control over the spawned task, it is effectively detached.
      * @param task The task to execute on this io_scheduler.  It's lifetime ownership will be transferred
      *             to this io_scheduler.
+     * @return True if the task was succesfully spawned onto the io_scheduler. This can fail if the task
+     *         is already completed or does not contain a valid coroutine anymore.
      */
-    auto schedule(coro::task<void>&& task) -> void
+    auto spawn(coro::task<void>&& task) -> bool;
+
+    /**
+     * Schedules a task on the io_scheduler and returns another task that must be awaited on for completion.
+     * This can be done via co_await in a coroutine context or coro::sync_wait() outside of coroutine context.
+     * @tparam return_type The return value of the task.
+     * @param task The task to schedule on the io_scheduler.
+     * @return The task to await for the input task to complete.
+     */
+    template<typename return_type>
+    [[nodiscard]] auto schedule(coro::task<return_type> task) -> coro::task<return_type>
     {
-        auto* ptr = static_cast<coro::task_container<coro::io_scheduler>*>(m_owned_tasks);
-        ptr->start(std::move(task));
+        co_await schedule();
+        co_return co_await task;
     }
+
+    /**
+     * Schedules a task on the io_scheduler that must complete within the given timeout.
+     * NOTE: This version of schedule does *NOT* cancel the given task, it will continue executing even if it times out.
+     *       It is absolutely recommended to use the version of this schedule() function that takes an std::stop_token
+     * and have the scheduled task check to see if its been cancelled due to timeout to not waste resources.
+     * @tparam return_type The return value of the task.
+     * @param task The task to schedule on the io_scheduler with the given timeout.
+     * @param timeout How long should this task be given to complete before it times out?
+     * @return The task to await for the input task to complete.
+     */
+    template<typename return_type, typename rep, typename period>
+    [[nodiscard]] auto schedule(coro::task<return_type> task, std::chrono::duration<rep, period> timeout)
+        -> coro::task<coro::expected<return_type, timeout_status>>
+    {
+        using namespace std::chrono_literals;
+
+        // If negative or 0 timeout, just schedule the task as normal.
+        auto timeout_ms = std::max(std::chrono::duration_cast<std::chrono::milliseconds>(timeout), 0ms);
+        if (timeout_ms == 0ms)
+        {
+            co_return coro::expected<return_type, timeout_status>(co_await schedule(std::move(task)));
+        }
+
+        auto result = co_await when_any(std::move(task), make_timeout_task(timeout_ms));
+        if (!std::holds_alternative<timeout_status>(result))
+        {
+            co_return coro::expected<return_type, timeout_status>(std::move(std::get<0>(result)));
+        }
+        else
+        {
+            co_return coro::unexpected<timeout_status>(std::move(std::get<1>(result)));
+        }
+    }
+
+#ifndef EMSCRIPTEN
+    /**
+     * Schedules a task on the io_scheduler that must complete within the given timeout.
+     * NOTE: This version of the task will have the stop_source.request_stop() be called if the timeout triggers.
+     *       It is up to you to check in the scheduled task if the stop has been requested to actually stop executing
+     *       the task.
+     * @tparam return_type The return value of the task.
+     * @param task The task to schedule on the io_scheduler with the given timeout.
+     * @param timeout How long should this task be given to complete before it times out?
+     * @return The task to await for the input task to complete.
+     */
+    template<typename return_type, typename rep, typename period>
+    [[nodiscard]] auto
+        schedule(std::stop_source stop_source, coro::task<return_type> task, std::chrono::duration<rep, period> timeout)
+            -> coro::task<coro::expected<return_type, timeout_status>>
+    {
+        using namespace std::chrono_literals;
+
+        // If negative or 0 timeout, just schedule the task as normal.
+        auto timeout_ms = std::max(std::chrono::duration_cast<std::chrono::milliseconds>(timeout), 0ms);
+        if (timeout_ms == 0ms)
+        {
+            co_return coro::expected<return_type, timeout_status>(co_await schedule(std::move(task)));
+        }
+
+        auto result = co_await when_any(std::move(stop_source), std::move(task), make_timeout_task(timeout_ms));
+        if (!std::holds_alternative<timeout_status>(result))
+        {
+            co_return coro::expected<return_type, timeout_status>(std::move(std::get<0>(result)));
+        }
+        else
+        {
+            co_return coro::unexpected<timeout_status>(std::move(std::get<1>(result)));
+        }
+    }
+#endif
 
     /**
      * Schedules the current task to run after the given amount of time has elapsed.
@@ -187,7 +290,10 @@ public:
     /**
      * Yields the current task to the end of the queue of waiting tasks.
      */
-    [[nodiscard]] auto yield() -> schedule_operation { return schedule_operation{*this}; };
+    [[nodiscard]] auto yield() -> schedule_operation
+    {
+        return schedule_operation{*this};
+    };
 
     /**
      * Yields the current task for the given amount of time.
@@ -235,10 +341,21 @@ public:
      * Resumes execution of a direct coroutine handle on this io scheduler.
      * @param handle The coroutine handle to resume execution.
      */
-    auto resume(std::coroutine_handle<> handle) -> void
+    auto resume(std::coroutine_handle<> handle) -> bool
     {
+        if (handle == nullptr || handle.done())
+        {
+            return false;
+        }
+
+        if (m_shutdown_requested.load(std::memory_order::acquire))
+        {
+            return false;
+        }
+
         if (m_opts.execution_strategy == execution_strategy_t::process_tasks_inline)
         {
+            m_size.fetch_add(1, std::memory_order::release);
             {
                 std::scoped_lock lk{m_scheduled_tasks_mutex};
                 m_scheduled_tasks.emplace_back(handle);
@@ -251,10 +368,12 @@ public:
                 eventfd_t value{1};
                 eventfd_write(m_schedule_fd, value);
             }
+
+            return true;
         }
         else
         {
-            m_thread_pool->resume(handle);
+            return m_thread_pool->resume(handle);
         }
     }
 
@@ -286,17 +405,6 @@ public:
      * prior to shutting down.  This call is blocking and will not return until all tasks complete.
      */
     auto shutdown() noexcept -> void;
-
-    /**
-     * Scans for completed coroutines and destroys them freeing up resources.  This is also done on starting
-     * new tasks but this allows the user to cleanup resources manually.  One usage might be making sure fds
-     * are cleaned up as soon as possible.
-     */
-    auto garbage_collect() noexcept -> void
-    {
-        auto* ptr = static_cast<coro::task_container<coro::io_scheduler>*>(m_owned_tasks);
-        ptr->garbage_collect();
-    }
 
 private:
     /// The configuration options.
@@ -338,11 +446,6 @@ private:
     std::mutex                           m_scheduled_tasks_mutex{};
     std::vector<std::coroutine_handle<>> m_scheduled_tasks{};
 
-    /// Tasks that have their ownership passed into the scheduler.  This is a bit strange for now
-    /// but the concept doesn't pass since io_scheduler isn't fully defined yet.
-    /// The type is coro::task_container<coro::io_scheduler>*
-    void* m_owned_tasks{nullptr};
-
     static constexpr const int   m_shutdown_object{0};
     static constexpr const void* m_shutdown_ptr = &m_shutdown_object;
 
@@ -364,6 +467,12 @@ private:
     auto add_timer_token(time_point tp, detail::poll_info& pi) -> timed_events::iterator;
     auto remove_timer_token(timed_events::iterator pos) -> void;
     auto update_timeout(time_point now) -> void;
+
+    auto make_timeout_task(std::chrono::milliseconds timeout) -> coro::task<timeout_status>
+    {
+        co_await schedule_after(timeout);
+        co_return timeout_status::timeout;
+    }
 };
 
 } // namespace coro

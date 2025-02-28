@@ -4,7 +4,7 @@ auto main() -> int
 {
     auto make_http_200_ok_server = [](std::shared_ptr<coro::io_scheduler> scheduler) -> coro::task<void>
     {
-        auto make_on_connection_task = [](coro::net::tcp_client client) -> coro::task<void>
+        auto make_on_connection_task = [](coro::net::tcp::client client) -> coro::task<void>
         {
             std::string response =
                 R"(HTTP/1.1 200 OK
@@ -36,7 +36,7 @@ Connection: keep-alive
         };
 
         co_await scheduler->schedule();
-        coro::net::tcp_server server{scheduler, coro::net::tcp_server::options{.port = 8888}};
+        coro::net::tcp::server server{scheduler, coro::net::tcp::server::options{.port = 8888}};
 
         while (true)
         {
@@ -46,15 +46,10 @@ Connection: keep-alive
             {
                 case coro::poll_status::event:
                 {
-                    // Coroutines in the scheduler are cleaned up when another once replaces them, but sockets need
-                    // to be manually "closed" otherwise we could run out of file descriptors if the ulimit isn't high
-                    // enough. Calling garbage collect here will destroy completed coroutine frames.
-                    scheduler->garbage_collect();
-
                     auto client = server.accept();
                     if (client.socket().is_valid())
                     {
-                        scheduler->schedule(make_on_connection_task(std::move(client)));
+                        scheduler->spawn(make_on_connection_task(std::move(client)));
                     } // else report error or something if the socket was invalid or could not be accepted.
                 }
                 break;
@@ -72,7 +67,7 @@ Connection: keep-alive
     std::vector<coro::task<void>> workers{};
     for (size_t i = 0; i < std::thread::hardware_concurrency(); ++i)
     {
-        auto scheduler = std::make_shared<coro::io_scheduler>(coro::io_scheduler::options{
+        auto scheduler = coro::io_scheduler::make_shared(coro::io_scheduler::options{
             .execution_strategy = coro::io_scheduler::execution_strategy_t::process_tasks_inline});
 
         workers.push_back(make_http_200_ok_server(scheduler));
